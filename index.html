@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PPT学习助手 · 导入课件自动总结与出题</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">📚</span>
+    <div>
+      <h1>PPT学习助手</h1>
+      <p>导入课件 · 自动总结要点重难点 · 智能生成习题</p>
+    </div>
+  </div>
+  <div class="model-box">
+    <label for="modelSelect">AI 模型</label>
+    <select id="modelSelect" disabled><option>加载中…</option></select>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <!-- 上传区 -->
+  <section class="card" id="uploadCard">
+    <div id="dropZone" class="dropzone" tabindex="0" role="button" aria-label="上传 PPT">
+      <div class="dz-icon">📤</div>
+      <p class="dz-main">拖拽 PPT 到这里，或 <span class="link">点击选择文件</span></p>
+      <p class="dz-sub">支持 .pptx（PowerPoint / WPS 另存为 pptx）；文件在浏览器本地解析，仅提取文字送入 AI</p>
+    </div>
+    <input type="file" id="fileInput" accept=".pptx" hidden>
+
+    <div id="fileInfo" class="file-info hidden">
+      <div class="fi-row">
+        <span class="fi-icon">📊</span>
+        <div class="fi-meta">
+          <b id="fiName"></b>
+          <span id="fiStats" class="muted"></span>
+        </div>
+        <button id="btnClearFile" class="btn-ghost" type="button">重新选择</button>
+      </div>
+      <div id="slidePreview" class="slide-preview hidden"></div>
+      <button id="btnTogglePreview" class="btn-link" type="button">展开查看各页识别内容 ▾</button>
+    </div>
+  </section>
+
+  <!-- 设置区 -->
+  <section class="card" id="optionsCard">
+    <h2>⚙️ 生成设置</h2>
+    <div class="opts-grid">
+      <div class="opt">
+        <label for="optCount">题目数量</label>
+        <select id="optCount">
+          <option value="5">5 题</option>
+          <option value="8">8 题</option>
+          <option value="10" selected>10 题</option>
+          <option value="15">15 题</option>
+          <option value="20">20 题</option>
+        </select>
+      </div>
+      <div class="opt">
+        <label for="optDiff">题目难度</label>
+        <select id="optDiff">
+          <option value="mixed" selected>混合难度</option>
+          <option value="easy">基础（巩固概念）</option>
+          <option value="medium">进阶（理解应用）</option>
+          <option value="hard">挑战（综合分析）</option>
+        </select>
+      </div>
+      <div class="opt types">
+        <label>题型（可多选）</label>
+        <div class="chips" id="optTypes">
+          <label class="chip"><input type="checkbox" value="choice" checked>选择题</label>
+          <label class="chip"><input type="checkbox" value="fill" checked>填空题</label>
+          <label class="chip"><input type="checkbox" value="judge" checked>判断题</label>
+          <label class="chip"><input type="checkbox" value="short" checked>简答题</label>
+        </div>
+      </div>
+      <div class="opt wide">
+        <label for="optCustom">自定义要求（可选）</label>
+        <input id="optCustom" type="text" maxlength="200" placeholder="例如：针对易混淆知识点出题、多考计算应用、贴近期末考试风格">
+      </div>
+    </div>
+    <div class="actions">
+      <button id="btnGenerate" class="btn-primary" type="button" disabled>🚀 开始生成</button>
+      <button id="btnAbort" class="btn-danger hidden" type="button">⏹ 停止生成</button>
+    </div>
+  </section>
+
+  <!-- 进度区 -->
+  <section id="progressCard" class="card hidden" aria-live="polite">
+    <div class="steps">
+      <div class="step done" id="stepParse"><span class="dot">1</span>解析 PPT</div>
+      <div class="step active" id="stepAI"><span class="dot">2</span>AI 分析与生成</div>
+      <div class="step" id="stepDone"><span class="dot">3</span>完成</div>
+    </div>
+    <div class="progress-bar"><div class="progress-inner" id="progressInner"></div></div>
+    <p class="muted" id="progressText">正在准备…</p>
+  </section>
+
+  <!-- 错误提示 -->
+  <div id="errorBanner" class="banner banner-error hidden"></div>
+  <!-- 模型未配置提示 -->
+  <div id="modelBanner" class="banner banner-warn hidden"></div>
+
+  <!-- 结果区 -->
+  <section id="resultCard" class="card hidden">
+    <div class="result-head">
+      <div class="result-title">
+        <h2 id="rTitle">—</h2>
+        <p id="rOverview" class="muted"></p>
+      </div>
+      <div class="result-actions">
+        <button id="btnToggleAns" class="btn-ghost" type="button">👁 显示答案</button>
+        <button id="btnCopy" class="btn-ghost" type="button">📋 复制</button>
+        <button id="btnMd" class="btn-ghost" type="button">⬇️ 导出 Markdown</button>
+        <button id="btnPrint" class="btn-ghost" type="button">🖨 打印</button>
+      </div>
+    </div>
+    <div class="tabs" role="tablist">
+      <button class="tab active" data-tab="points" type="button">📌 课堂要点</button>
+      <button class="tab" data-tab="hard" type="button">🔑 重难点</button>
+      <button class="tab" data-tab="quiz" type="button">✏️ 练习题</button>
+    </div>
+    <div id="tab-points" class="tabpane"></div>
+    <div id="tab-hard" class="tabpane hidden"></div>
+    <div id="tab-quiz" class="tabpane hidden"></div>
+    <p class="muted small" id="rMeta"></p>
+  </section>
+
+  <!-- 历史记录 -->
+  <section class="card" id="historyCard">
+    <h2>🕘 历史记录 <span class="muted small">（仅保存在本机浏览器，不上传）</span></h2>
+    <div id="historyList" class="history-list"></div>
+  </section>
+
+  <footer class="footer">
+    <p>PPT学习助手 · 课件文字仅在浏览器本地提取，AI 分析经 WorkBuddy 云服务完成 · 生成内容仅供学习参考</p>
+  </footer>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tencent-ai/workbuddy-cloud-sdk@dev/lib/index.global.js"></script>
+<script src="assets/config.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>
