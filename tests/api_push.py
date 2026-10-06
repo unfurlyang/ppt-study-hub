@@ -50,7 +50,14 @@ FILES = [
     "assets/config.js",
     "assets/style.css",
     "tests/make_sample.py",
+    "tests/make_samples.py",
+    "tests/make_big_txt.py",
     "tests/api_push.py",
+    "tests/samples/sample.docx",
+    "tests/samples/sample.pdf",
+    "tests/samples/sample.txt",
+    "tests/samples/sample.md",
+    "tests/samples/big.txt",
     "tests/样例课件-牛顿第一定律.pptx",
     "tests/e2e-result.png",
 ]
@@ -67,7 +74,7 @@ for f in FILES:
 
 t = req("POST", "/repos/%s/git/trees" % REPO, {"tree": tree})
 c = req("POST", "/repos/%s/git/commits" % REPO, {
-    "message": "feat: PPT学习助手 v1 - 导入PPT自动总结课堂要点、重难点并生成习题",
+    "message": "feat: 支持多格式课件解析（.pptx/.pdf/.docx/.txt/.md）+ 长文档自动分块",
     "tree": t["sha"],
     "parents": [parent],
 })

@@ -34,7 +34,7 @@
   ].join('\n');
 
   var SYSTEM_PROMPT = [
-    '你是一位资深的教研助理，擅长把课堂 PPT 课件转化为高质量学习资料。用户会提供一份课件逐页提取的文字（每页以【第N页】开头，部分页附带"备注"）。',
+    '你是一位资深的教研助理，擅长把课堂课件转化为高质量学习资料。用户会提供一份课件逐单元提取的文字（每个单元以【第N页】或【第N部分】开头，部分单元附带"备注"）。',
     '你的任务：',
     '1. 提炼课堂要点（核心知识点 + 简要讲解）；',
     '2. 区分重点（必须掌握）与难点（难理解/易出错），并各给出掌握建议；',
@@ -155,6 +155,133 @@
     return msg;
   }
 
+  // ---------- 多格式解析 ----------
+  var PDFJS_URLS = {
+    lib: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
+    worker: 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js',
+  };
+  var loadedScripts = {};
+  var PDF_MAX_PAGES = 300;
+  var DOC_CHUNK_LIMIT = 1200;
+
+  function loadScriptOnce(src) {
+    if (!loadedScripts[src]) {
+      loadedScripts[src] = new Promise(function (resolve, reject) {
+        var s = document.createElement('script');
+        s.src = src;
+        s.onload = function () { resolve(); };
+        s.onerror = function () { delete loadedScripts[src]; reject(new Error('CDN_LOAD_FAIL')); };
+        document.head.appendChild(s);
+      });
+    }
+    return loadedScripts[src];
+  }
+
+  function detectKind(name) {
+    var n = String(name).toLowerCase();
+    if (/\.pptx$/.test(n)) return 'pptx';
+    if (/\.pdf$/.test(n)) return 'pdf';
+    if (/\.docx$/.test(n)) return 'docx';
+    if (/\.(txt|md|markdown)$/.test(n)) return 'txt';
+    if (/\.ppt$/.test(n)) return 'legacy-ppt';
+    if (/\.doc$/.test(n)) return 'legacy-doc';
+    return 'unknown';
+  }
+
+  function sumChars(slides) {
+    var total = 0;
+    slides.forEach(function (s) { total += s.texts.join(' ').length + (s.notes || '').length; });
+    return total;
+  }
+
+  // 把段落序列按字数切成"部分"（docx/txt 没有可靠分页概念）
+  function chunkParas(paras, unitLabel) {
+    var units = [], buf = [], size = 0;
+    paras.forEach(function (t) {
+      if (size + t.length > DOC_CHUNK_LIMIT && buf.length) {
+        units.push(buf); buf = []; size = 0;
+      }
+      buf.push(t); size += t.length + 1;
+    });
+    if (buf.length) units.push(buf);
+    return {
+      slides: units.map(function (texts, i) { return { no: i + 1, texts: texts, notes: '' }; }),
+      totalChars: sumChars(units.map(function (texts, i) { return { texts: texts, no: i + 1, notes: '' }; })),
+      unit: unitLabel, // 'section'
+    };
+  }
+
+  function parsePdf(file) {
+    return loadScriptOnce(PDFJS_URLS.lib).then(function () {
+      if (!window.pdfjsLib) throw new Error('CDN_LOAD_FAIL');
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_URLS.worker;
+      return file.arrayBuffer();
+    }).then(function (buf) {
+      return window.pdfjsLib.getDocument({ data: buf }).promise;
+    }).then(function (doc) {
+      var pages = [];
+      var count = Math.min(doc.numPages, PDF_MAX_PAGES);
+      var chain = Promise.resolve();
+      var i;
+      function one(no) {
+        chain = chain.then(function () {
+          return doc.getPage(no).then(function (page) {
+            return page.getTextContent();
+          }).then(function (tc) {
+            var text = '';
+            (tc.items || []).forEach(function (it) {
+              text += it.str || '';
+              if (it.hasEOL) text += '\n';
+            });
+            text = text.replace(/[ \t]+/g, ' ').trim();
+            pages.push({ no: no, texts: text ? text.split('\n').map(function (l) { return l.trim(); }).filter(Boolean) : [], notes: '' });
+          });
+        });
+      }
+      for (i = 1; i <= count; i++) one(i);
+      return chain.then(function () {
+        return {
+          slides: pages,
+          totalChars: sumChars(pages),
+          unit: 'page',
+          kindLabel: 'PDF',
+          truncated: doc.numPages > PDF_MAX_PAGES,
+        };
+      });
+    });
+  }
+
+  function parseDocx(file) {
+    return window.JSZip.loadAsync(file).then(function (zip) {
+      var doc = zip.file('word/document.xml');
+      if (!doc) throw new Error('BAD_DOCX');
+      return doc.async('string');
+    }).then(function (xml) {
+      var paras = xml.split('</w:p>').map(function (p) {
+        var runs = p.match(/<w:t[^>]*>[^<]*<\/w:t>/g) || [];
+        return runs.map(function (r) {
+          return decodeXmlEntities(r.replace(/^<w:t[^>]*>/, '').replace(/<\/w:t>$/, ''));
+        }).join('');
+      }).map(function (s) { return s.trim(); }).filter(Boolean);
+      if (!paras.length) throw new Error('EMPTY_TEXT');
+      var out = chunkParas(paras, 'section');
+      out.kindLabel = 'Word';
+      return out;
+    });
+  }
+
+  function parseTxt(file) {
+    return file.text().then(function (raw) {
+      var text = raw.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+      var paras = text.split(/\n\s*\n+/).map(function (s) { return s.trim(); }).filter(Boolean);
+      if (!paras.length) paras = text.split('\n').map(function (s) { return s.trim(); }).filter(Boolean);
+      if (!paras.length) throw new Error('EMPTY_TEXT');
+      var out = chunkParas(paras, 'section');
+      out.kindLabel = '文本';
+      return out;
+    });
+  }
+
   // ---------- PPTX 解析 ----------
   function parsePptx(file) {
     return window.JSZip.loadAsync(file).then(function (zip) {
@@ -204,7 +331,7 @@
         slides.forEach(function (s) {
           total += s.texts.join(' ').length + s.notes.length;
         });
-        return { slides: slides, totalChars: total };
+        return { slides: slides, totalChars: total, unit: 'page', kindLabel: 'PPT', truncated: false };
       });
     });
 
@@ -214,11 +341,12 @@
     }
   }
 
-  function buildSourceText(slides) {
+  function buildSourceText(slides, unit) {
+    var tag = unit === 'section' ? '部分' : '页';
     return slides.map(function (s) {
       var body = s.texts.join('\n');
       var n = s.notes ? ('\n备注：' + s.notes) : '';
-      return '【第' + s.no + '页】\n' + body + n;
+      return '【第' + s.no + tag + '】\n' + body + n;
     }).join('\n\n');
   }
 
@@ -283,7 +411,8 @@
     $('resultCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
 
     var slides = state.parsed.slides;
-    var sourceText = buildSourceText(slides);
+    var unitNoun = state.parsed.unit === 'section' ? '段' : '页';
+    var sourceText = buildSourceText(slides, state.parsed.unit);
     var model = currentModel.id;
     var signal = state.controller.signal;
     var t0 = Date.now();
@@ -293,7 +422,7 @@
       prepare = Promise.resolve(sourceText);
     } else {
       // 长课件：分块压缩后再生成
-      var chunks = chunkSlides(slides);
+      var chunks = chunkSlides(slides, state.parsed.unit);
       setProgress(22, '课件较长（' + sourceText.length + ' 字），先分 ' + chunks.length + ' 部分精读压缩…');
       prepare = chunks.reduce(function (chain, part, idx) {
         return chain.then(function (acc) {
@@ -318,7 +447,7 @@
       var custom = ($('optCustom').value || '').trim();
       var diffText = { mixed: '混合难度（基础约40%、进阶约40%、挑战约20%）', easy: '全部基础题', medium: '全部进阶题', hard: '全部挑战题' }[diff];
       var userMsg = [
-        '【课件信息】共 ' + slides.length + ' 页，提取文字约 ' + sourceText.length + ' 字。',
+        '【课件信息】文件格式：' + (state.parsed.kindLabel || 'PPT') + '；共 ' + slides.length + ' ' + unitNoun + '，提取文字约 ' + sourceText.length + ' 字。',
         '【出题要求】题型：' + types.map(function (t) { return TYPE_LABEL[t]; }).join('、') +
           '；总题量：' + count + ' 题（各题型大致均衡分配）；难度：' + diffText + '。' +
           (custom ? '\n【附加要求】' + custom : ''),
@@ -346,6 +475,7 @@
         model: currentModel && (currentModel.name || currentModel.id) || '',
         date: Date.now(),
         condensed: sourceText.length > FULL_TEXT_LIMIT,
+        unit: state.parsed.unit || 'page',
       };
       renderResult(result, state.lastMeta);
       saveHistory(result, state.lastMeta);
@@ -369,10 +499,10 @@
     });
   }
 
-  function chunkSlides(slides) {
+  function chunkSlides(slides, unit) {
     var parts = [], buf = [], size = 0;
     slides.forEach(function (s) {
-      var t = buildSourceText([s]);
+      var t = buildSourceText([s], unit);
       if (size + t.length > CHUNK_LIMIT && buf.length) {
         parts.push(buf.join('\n\n'));
         buf = []; size = 0;
@@ -384,22 +514,24 @@
   }
 
   // ---------- 渲染 ----------
-  function slideBadges(arr) {
+  function slideBadges(arr, unit) {
+    var noun = unit === 'section' ? '段' : '页';
     return (Array.isArray(arr) ? arr : []).slice(0, 8).map(function (n) {
-      return '<span class="badge badge-slide">第' + escapeHtml(n) + '页</span>';
+      return '<span class="badge badge-slide">第' + escapeHtml(n) + noun + '</span>';
     }).join(' ');
   }
 
   function renderResult(r, meta) {
+    var unit = meta.unit || 'page';
     $('rTitle').textContent = r.title || meta.fileName;
     $('rOverview').textContent = r.overview || '';
-    $('rMeta').textContent = '来源：' + meta.fileName + '（' + meta.slideCount + ' 页' +
+    $('rMeta').textContent = '来源：' + meta.fileName + '（' + meta.slideCount + ' ' + (unit === 'section' ? '段' : '页') +
       (meta.condensed ? '，长文已压缩' : '') + '）· 模型：' + meta.model + ' · ' + fmtDate(meta.date);
 
     // 课堂要点
     var kpHtml = (r.keyPoints || []).map(function (k, i) {
       return '<div class="kp-item"><div class="kp-num">' + (i + 1) + '</div>' +
-        '<div class="kp-body"><b>' + escapeHtml(k.point) + '</b>' + slideBadges(k.slides) +
+        '<div class="kp-body"><b>' + escapeHtml(k.point) + '</b>' + slideBadges(k.slides, unit) +
         '<p>' + escapeHtml(k.detail) + '</p></div></div>';
     }).join('');
     $('tab-points').innerHTML = kpHtml || '<p class="muted">未生成要点。</p>';
@@ -408,7 +540,7 @@
     function hdItem(it, cls, label) {
       if (!it) return '';
       return '<div class="hd-item"><h4><span class="badge ' + cls + '">' + label + '</span>' +
-        escapeHtml(it.point) + slideBadges(it.slides) + '</h4>' +
+        escapeHtml(it.point) + slideBadges(it.slides, unit) + '</h4>' +
         (it.why ? '<p>' + escapeHtml(it.why) + '</p>' : '') +
         (it.tip ? '<div class="tip">💡 ' + escapeHtml(it.tip) + '</div>' : '') +
         '</div>';
@@ -447,15 +579,16 @@
 
   // ---------- 导出 ----------
   function buildMarkdown(r, meta) {
+    var unitNoun = meta.unit === 'section' ? '段' : '页';
     var L = [];
     L.push('# ' + (r.title || '课堂学习资料'));
     if (r.overview) L.push('> ' + r.overview);
     L.push('');
-    L.push('来源：' + meta.fileName + '（' + meta.slideCount + ' 页） · 生成时间：' + fmtDate(meta.date));
+    L.push('来源：' + meta.fileName + '（' + meta.slideCount + ' ' + unitNoun + '） · 生成时间：' + fmtDate(meta.date));
     L.push('');
     L.push('## 📌 课堂要点');
     (r.keyPoints || []).forEach(function (k, i) {
-      L.push((i + 1) + '. **' + k.point + '**' + (k.slides && k.slides.length ? '（第' + k.slides.join('、') + '页）' : ''));
+      L.push((i + 1) + '. **' + k.point + '**' + (k.slides && k.slides.length ? '（第' + k.slides.join('、') + unitNoun + '）' : ''));
       if (k.detail) L.push('   - ' + k.detail);
     });
     L.push('');
@@ -506,6 +639,7 @@
       fileName: meta.fileName,
       slideCount: meta.slideCount,
       date: meta.date,
+      unit: meta.unit || 'page',
       result: result,
     });
     if (list.length > 20) list = list.slice(0, 20);
@@ -551,10 +685,20 @@
     });
   }
 
+  var LEGACY_HINT = {
+    'legacy-ppt': '旧版 .ppt 是二进制格式，浏览器无法直接解析。请用 PowerPoint / WPS 打开后「文件 → 另存为 → .pptx」，再上传新文件即可。',
+    'legacy-doc': '旧版 .doc 是二进制格式，浏览器无法直接解析。请用 Word / WPS 打开后「文件 → 另存为 → .docx」，再上传新文件即可。',
+  };
+
   function acceptFile(file) {
     if (!file) return;
-    if (!/\.pptx$/i.test(file.name)) {
-      showError('目前仅支持 .pptx 格式。请用 PowerPoint / WPS 将旧版 .ppt「另存为」.pptx 后再上传。');
+    var kind = detectKind(file.name);
+    if (kind === 'unknown') {
+      showError('暂不支持该格式。目前支持 .pptx / .pdf / .docx / .txt / .md；旧版 .ppt / .doc 请先另存为新格式。');
+      return;
+    }
+    if (LEGACY_HINT[kind]) {
+      showError(LEGACY_HINT[kind]);
       return;
     }
     if (file.size > 80 * 1024 * 1024) {
@@ -565,17 +709,28 @@
     state.file = file;
     var dz = $('dropZone');
     dz.innerHTML = '<div class="dz-icon">⏳</div><p class="dz-main">正在解析「' + escapeHtml(file.name) + '」…</p>';
-    parsePptx(file).then(function (parsed) {
+
+    var parser;
+    if (kind === 'pptx') parser = parsePptx(file);
+    else if (kind === 'pdf') parser = parsePdf(file);
+    else if (kind === 'docx') parser = parseDocx(file);
+    else parser = parseTxt(file);
+
+    parser.then(function (parsed) {
       state.parsed = parsed;
+      var unitNoun = parsed.unit === 'section' ? '段' : '页';
       var noText = parsed.slides.filter(function (s) { return s.texts.length || s.notes; }).length;
       if (!parsed.totalChars) throw new Error('EMPTY_TEXT');
       $('fiName').textContent = file.name;
-      $('fiStats').textContent = '共 ' + parsed.slides.length + ' 页 · 提取文字 ' + parsed.totalChars +
-        ' 字 · 有内容的页面 ' + noText + ' 页' + (parsed.totalChars > FULL_TEXT_LIMIT ? '（长课件，将自动分段精读）' : '');
+      $('fiStats').textContent = '格式：' + (parsed.kindLabel || 'PPT') + ' · 共 ' + parsed.slides.length + ' ' + unitNoun +
+        ' · 提取文字 ' + parsed.totalChars + ' 字 · 有内容 ' + noText + ' ' + unitNoun +
+        (parsed.truncated ? '（超出 ' + PDF_MAX_PAGES + ' 页上限，仅取前 ' + PDF_MAX_PAGES + ' 页）' : '') +
+        (parsed.totalChars > FULL_TEXT_LIMIT ? '（长课件，将自动分段精读）' : '');
+      var unitMark = parsed.unit === 'section' ? '段' : 'P';
       var prev = parsed.slides.slice(0, 60).map(function (s) {
-        var t = (s.texts.join(' / ') || (s.notes ? '（仅备注）' : '（本页无文字，可能为图片页）'));
+        var t = (s.texts.join(' / ') || (s.notes ? '（仅备注）' : '（本' + unitNoun + '无文字，可能为图片' + unitNoun + '）'));
         if (t.length > 90) t = t.slice(0, 90) + '…';
-        return '<div class="sp-item"><b>P' + s.no + '</b>' + escapeHtml(t) + '</div>';
+        return '<div class="sp-item"><b>' + unitMark + s.no + '</b>' + escapeHtml(t) + '</div>';
       }).join('');
       $('slidePreview').innerHTML = prev;
       $('btnGenerate').disabled = false;
@@ -585,11 +740,13 @@
     }).catch(function (err) {
       resetFile();
       if (err.message === 'EMPTY_TEXT') {
-        showError('未能从该 PPT 提取到文字：可能是纯图片课件。请尝试在备注中补充内容，或使用文字版课件。');
-      } else if (err.message === 'NO_SLIDES') {
-        showError('文件里没有找到幻灯片，请确认这是有效的 .pptx 文件。');
+        showError('未能从该文件提取到文字：可能是纯图片/扫描件（如图片型 PDF）。请使用含文字的版本。');
+      } else if (err.message === 'CDN_LOAD_FAIL') {
+        showError('PDF 解析组件加载失败，请检查网络后重试。');
+      } else if (err.message === 'BAD_DOCX' || err.message === 'NO_SLIDES') {
+        showError('文件里没有找到有效内容，请确认文件未损坏且格式正确。');
       } else {
-        showError('解析失败：文件可能已损坏或不是标准 pptx。');
+        showError('解析失败：文件可能已损坏或不是标准格式。');
       }
     });
   }
@@ -600,8 +757,8 @@
     $('btnGenerate').disabled = true;
     hide($('fileInfo'));
     var dz = $('dropZone');
-    dz.innerHTML = '<div class="dz-icon">📤</div><p class="dz-main">拖拽 PPT 到这里，或 <span class="link">点击选择文件</span></p>' +
-      '<p class="dz-sub">支持 .pptx（PowerPoint / WPS 另存为 pptx）；文件在浏览器本地解析，仅提取文字送入 AI</p>';
+    dz.innerHTML = '<div class="dz-icon">📤</div><p class="dz-main">拖拽课件到这里，或 <span class="link">点击选择文件</span></p>' +
+      '<p class="dz-sub">支持 .pptx / .pdf / .docx / .txt / .md（旧版 .ppt/.doc 请先另存为新格式）；文件在浏览器本地解析，仅提取文字送入 AI</p>';
   }
 
   function bindEvents() {
@@ -676,7 +833,7 @@
         state.lastResult = h.result;
         state.lastMeta = {
           fileName: h.fileName, slideCount: h.slideCount, chars: 0,
-          model: '（历史）', date: h.date, condensed: false,
+          model: '（历史）', date: h.date, condensed: false, unit: h.unit || 'page',
         };
         renderResult(h.result, state.lastMeta);
         $('resultCard').scrollIntoView({ behavior: 'smooth', block: 'start' });

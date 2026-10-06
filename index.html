@@ -28,10 +28,10 @@
   <section class="card" id="uploadCard">
     <div id="dropZone" class="dropzone" tabindex="0" role="button" aria-label="上传 PPT">
       <div class="dz-icon">📤</div>
-      <p class="dz-main">拖拽 PPT 到这里，或 <span class="link">点击选择文件</span></p>
-      <p class="dz-sub">支持 .pptx（PowerPoint / WPS 另存为 pptx）；文件在浏览器本地解析，仅提取文字送入 AI</p>
+      <p class="dz-main">拖拽课件到这里，或 <span class="link">点击选择文件</span></p>
+      <p class="dz-sub">支持 .pptx / .pdf / .docx / .txt / .md（旧版 .ppt/.doc 请先另存为新格式）；文件在浏览器本地解析，仅提取文字送入 AI</p>
     </div>
-    <input type="file" id="fileInput" accept=".pptx" hidden>
+    <input type="file" id="fileInput" accept=".pptx,.pdf,.docx,.txt,.md,.markdown" hidden>
 
     <div id="fileInfo" class="file-info hidden">
       <div class="fi-row">
